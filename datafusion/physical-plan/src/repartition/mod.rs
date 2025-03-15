@@ -40,8 +40,8 @@ use crate::sorts::streaming_merge::StreamingMergeBuilder;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, Statistics};
 
-use arrow::array::{PrimitiveArray, RecordBatch, RecordBatchOptions};
-use arrow::compute::take_arrays;
+use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder, PrimitiveArray, RecordBatch, RecordBatchOptions};
+use arrow::compute::{filter, take_arrays};
 use arrow::datatypes::{SchemaRef, UInt32Type};
 use datafusion_common::utils::transpose;
 use datafusion_common::HashMap;
@@ -277,43 +277,45 @@ impl BatchPartitioner {
 
                     create_hashes(&arrays, random_state, hash_buffer)?;
 
-                    let mut indices: Vec<_> = (0..*partitions)
-                        .map(|_| Vec::with_capacity(batch.num_rows()))
+                    // 初始化每个分区的 BooleanBufferBuilder
+                    let num_rows = batch.num_rows();
+                    let mut builders: Vec<BooleanBufferBuilder> = (0..*partitions)
+                        .map(|_| {
+                            let mut builder = BooleanBufferBuilder::new(num_rows);
+                            builder.append_n(num_rows, false); // 初始填充 false
+                            builder
+                        })
                         .collect();
 
-                    for (index, hash) in hash_buffer.iter().enumerate() {
-                        indices[(*hash % *partitions as u64) as usize].push(index as u32);
+                    // 单次循环设置所有分区的掩码
+                    for (idx, &hash) in hash_buffer.iter().enumerate() {
+                        let partition = (hash % *partitions as u64) as usize;
+                        builders[partition].set_bit(idx, true); // 直接设置位值
                     }
 
-                    // Finished building index-arrays for output partitions
+                    // 转换为 BooleanArray
+                    let masks: Vec<BooleanArray> = builders
+                        .into_iter()
+                        .map(|mut builder| {
+                            BooleanArray::from(builder.finish())
+                        })
+                        .collect();
                     timer.done();
 
-                    // Borrowing partitioner timer to prevent moving `self` to closure
                     let partitioner_timer = &self.timer;
-                    let it = indices
+                    // 使用 filter 生成分区数据
+                    let it = masks
                         .into_iter()
                         .enumerate()
-                        .filter_map(|(partition, indices)| {
-                            let indices: PrimitiveArray<UInt32Type> = indices.into();
-                            (!indices.is_empty()).then_some((partition, indices))
-                        })
-                        .map(move |(partition, indices)| {
-                            // Tracking time required for repartitioned batches construction
+                        .filter(|(_, mask)| mask.true_count() > 0)
+                        .map(move |(partition, mask)| {
                             let _timer = partitioner_timer.timer();
-
-                            // Produce batches based on indices
-                            let columns = take_arrays(batch.columns(), &indices, None)?;
-
-                            let mut options = RecordBatchOptions::new();
-                            options = options.with_row_count(Some(indices.len()));
-                            let batch = RecordBatch::try_new_with_options(
-                                batch.schema(),
-                                columns,
-                                &options,
-                            )
-                            .unwrap();
-
-                            Ok((partition, batch))
+                            let columns = batch.columns()
+                                .iter()
+                                .map(|col| filter(col, &mask).map_err(|e| DataFusionError::ArrowError(e, None)))
+                                .collect::<Result<Vec<ArrayRef>>>()?;
+                            RecordBatch::try_new(batch.schema(), columns)
+                                .map(|batch| (partition, batch)).map_err(|e| DataFusionError::ArrowError(e, None))
                         });
 
                     Box::new(it)
