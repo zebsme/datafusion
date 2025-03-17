@@ -40,7 +40,8 @@ use crate::sorts::streaming_merge::StreamingMergeBuilder;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, Statistics};
 
-use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder, PrimitiveArray, RecordBatch, RecordBatchOptions};
+use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder, NullBufferBuilder, PrimitiveArray, RecordBatch, RecordBatchOptions};
+use arrow::buffer::BooleanBuffer;
 use arrow::compute::{filter, take_arrays};
 use arrow::datatypes::{SchemaRef, UInt32Type};
 use datafusion_common::utils::transpose;
@@ -282,11 +283,10 @@ impl BatchPartitioner {
                     let mut builders: Vec<BooleanBufferBuilder> = (0..*partitions)
                         .map(|_| {
                             let mut builder = BooleanBufferBuilder::new(num_rows);
-                            builder.append_n(num_rows, false); // 初始填充 false
+                            builder.append_n(num_rows, false);
                             builder
                         })
                         .collect();
-
                     // 单次循环设置所有分区的掩码
                     for (idx, &hash) in hash_buffer.iter().enumerate() {
                         let partition = (hash % *partitions as u64) as usize;
@@ -294,29 +294,87 @@ impl BatchPartitioner {
                     }
 
                     // 转换为 BooleanArray
-                    let masks: Vec<BooleanArray> = builders
-                        .into_iter()
-                        .map(|mut builder| {
-                            BooleanArray::from(builder.finish())
-                        })
-                        .collect();
-                    timer.done();
+                    // let masks: Vec<BooleanArray> = builders
+                    //     .into_iter()
+                    //     .map(|mut builder| {
+                    //         BooleanArray::from(builder.finish())
+                    //     })
+                    //     .collect();
+                    // let num_rows = batch.num_rows();
+                    // let mut partition_builders: Vec<NullBufferBuilder> = (0..*partitions)
+                    //     .map(|_| NullBufferBuilder::new(num_rows))
+                    //     .collect();
+                    //
+                    // for (idx, hash) in hash_buffer.iter().enumerate() {
+                    //     let partition = (hash % *partitions as u64) as usize;
+                    // builders[partition].set_bit(idx, true);
+                    // }
+                    //
+                    // // 2. 转换为BooleanArray（处理全true场景）
+                    // let masks: Vec<BooleanArray> = partition_builders
+                    //     .into_iter()
+                    //     .map(|mut builder| {
+                    //         builder.finish()
+                    //             .map(|buf| {
+                    //                 // 将BooleanBuffer转换为BooleanArray（无null位）
+                    //                 BooleanArray::new(buf.into_inner(), None) // 正确类型！
+                    //             })
+                    //             .unwrap_or_else(|| {
+                    //                 // 处理未分配缓冲区的全true场景
+                    //                 BooleanArray::from(vec![true; num_rows])
+                    //             })
+                    //     })
+                    //     .collect();
 
                     let partitioner_timer = &self.timer;
-                    // 使用 filter 生成分区数据
-                    let it = masks
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(_, mask)| mask.true_count() > 0)
-                        .map(move |(partition, mask)| {
-                            let _timer = partitioner_timer.timer();
-                            let columns = batch.columns()
-                                .iter()
-                                .map(|col| filter(col, &mask).map_err(|e| DataFusionError::ArrowError(e, None)))
-                                .collect::<Result<Vec<ArrayRef>>>()?;
-                            RecordBatch::try_new(batch.schema(), columns)
-                                .map(|batch| (partition, batch)).map_err(|e| DataFusionError::ArrowError(e, None))
-                        });
+                    // 3. 生成分区数据（优化filter调用）
+                    // let it = masks.into_iter()
+                    //     .enumerate()
+                    //     .filter(|(_, mask)| mask.true_count() > 0) // BooleanArray可直接调用
+                    //     .map(move |(partition, mask)| {
+                    //         let _timer = partitioner_timer.timer();
+                    //         let columns = batch.columns()
+                    //             .iter()
+                    //             .map(|col| {
+                    //                 // 传入BooleanArray的引用 ↓
+                    //                 filter(col, &mask)
+                    //                     .map_err(|e| DataFusionError::ArrowError(e, None))
+                    //             })
+                    //             .collect::<Result<Vec<ArrayRef>>>()?;
+                    //
+                    //         RecordBatch::try_new(batch.schema(), columns)
+                    //             .map(|batch| (partition, batch))
+                    //             .map_err(|e| DataFusionError::ArrowError(e, None))
+                    //     });
+                    // let it = builders.into_iter().enumerate().filter_map(|(partition, mut builder)| {
+                    //     let mask = BooleanArray::from(builder.finish());
+                    //     (mask.true_count() > 0).then(|| {
+                    //         // 直接在此处处理过滤和列生成
+                    //         let columns = batch.columns().iter()
+                    //             .map(|col| filter(col, &mask))
+                    //             .collect::<Result<_>>()?;
+                    //         Ok((partition, RecordBatch::try_new(...)?))
+                    //     })
+                    // });
+                    let it = builders.into_iter().enumerate().filter_map(move|(partition, mut builder)| {
+                        let mask = BooleanArray::from(builder.finish());
+                        if mask.true_count() == 0 {
+                            return None; // 跳过空分区
+                        }
+
+                        let _timer = partitioner_timer.timer();
+                        let columns = batch.columns()
+                            .iter()
+                            .map(|col| filter(col, &mask))
+                            .collect::<Result<Vec<ArrayRef>, _>>()
+                            .map_err(|e| DataFusionError::ArrowError(e, None));
+
+                        Some(columns.and_then(|cols| {
+                            RecordBatch::try_new(batch.schema(), cols)
+                                .map(|batch| (partition, batch))
+                                .map_err(|e| DataFusionError::ArrowError(e, None))
+                        }))
+                    });
 
                     Box::new(it)
                 }
