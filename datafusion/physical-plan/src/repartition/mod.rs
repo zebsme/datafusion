@@ -40,9 +40,9 @@ use crate::sorts::streaming_merge::StreamingMergeBuilder;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, Statistics};
 
-use arrow::array::{PrimitiveArray, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow::array::{RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow::compute::take_arrays;
-use arrow::datatypes::{SchemaRef, UInt32Type};
+use arrow::datatypes::SchemaRef;
 use datafusion_common::utils::transpose;
 use datafusion_common::HashMap;
 use datafusion_common::{not_impl_err, DataFusionError, Result};
@@ -54,7 +54,6 @@ use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
 use futures::stream::Stream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use itertools::Itertools;
 use log::trace;
 use parking_lot::Mutex;
 
@@ -264,7 +263,7 @@ impl BatchPartitioner {
                     exprs,
                     num_partitions: partitions,
                     hash_buffer,
-                } => unsafe {
+                } => {
                     // Tracking time required for distributing indexes across output partitions
                     let timer = self.timer.timer();
 
@@ -278,26 +277,25 @@ impl BatchPartitioner {
 
                     create_hashes(&arrays, random_state, hash_buffer)?;
 
-                    let timer = self.timer.timer();
-
                     let num_partitions = *partitions;
                     let partitions_u64 = num_partitions as u64;
 
+                    let p_buffer: Vec<usize> = hash_buffer
+                        .iter()
+                        .map(|h| (*h % partitions_u64) as usize)
+                        .collect();
+
+                    let mut counts = vec![0; num_partitions];
+                    p_buffer.iter().for_each(|&p| counts[p] += 1);
+
                     let mut offsets = vec![0; num_partitions + 1];
+                    (0..num_partitions)
+                        .for_each(|i| offsets[i + 1] = offsets[i] + counts[i]);
 
-                    hash_buffer.iter().for_each(|h| {
-                        let p = (*h % partitions_u64) as usize;
-                        offsets[p + 1] += 1;
-                    });
+                    let mut indices_data = vec![0; hash_buffer.len()];
+                    let mut write_pos = offsets[0..num_partitions].to_vec(); // 避免clone整个offsets
 
-                    (1..=num_partitions).for_each(|i| offsets[i] += offsets[i - 1]);
-
-                    let mut indices_data = Vec::with_capacity(hash_buffer.len());
-                    unsafe{indices_data.set_len(hash_buffer.len());}
-                    let mut write_pos = offsets.clone(); // 利用Rust的clone优化
-
-                    hash_buffer.iter().enumerate().for_each(|(row_idx, h)| {
-                        let p = (*h % partitions_u64) as usize;
+                    p_buffer.into_iter().enumerate().for_each(|(row_idx, p)| {
                         let pos = write_pos[p];
                         indices_data[pos] = row_idx as u32;
                         write_pos[p] = pos + 1;
@@ -307,30 +305,33 @@ impl BatchPartitioner {
 
                     let non_empty_partitions: Vec<_> = (0..num_partitions)
                         .filter_map(|p| {
-                            (offsets[p + 1] != offsets[p]).then(|| (p, offsets[p], offsets[p + 1] - offsets[p]))
+                            (offsets[p + 1] != offsets[p])
+                                .then(|| (p, offsets[p], offsets[p + 1] - offsets[p]))
                         })
                         .collect();
                     timer.done();
 
                     let partitioner_timer = &self.timer;
-                    Box::new(non_empty_partitions.into_iter().map(move |(partition, start, length)| {
-                        let _timer = partitioner_timer.timer();
-                        let partition_slice = indices_array.slice(start, length);
+                    Box::new(non_empty_partitions.into_iter().map(
+                        move |(partition, start, length)| {
+                            let _timer = partitioner_timer.timer();
+                            let partition_slice = indices_array.slice(start, length);
 
-                        let columns =
-                            take_arrays(batch.columns(), &partition_slice, None)?;
+                            let columns =
+                                take_arrays(batch.columns(), &partition_slice, None)?;
 
-                        let options = RecordBatchOptions::new()
-                            .with_row_count(Some(partition_slice.len()));
-                        let batch = RecordBatch::try_new_with_options(
-                            batch.schema(),
-                            columns,
-                            &options,
-                        )?;
+                            let options = RecordBatchOptions::new()
+                                .with_row_count(Some(partition_slice.len()));
+                            let batch = RecordBatch::try_new_with_options(
+                                batch.schema(),
+                                columns,
+                                &options,
+                            )?;
 
-                        Ok((partition, batch))
-                    }))
-                }
+                            Ok((partition, batch))
+                        },
+                    ))
+                },
             };
 
         Ok(it)
