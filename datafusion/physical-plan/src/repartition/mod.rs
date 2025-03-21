@@ -264,7 +264,7 @@ impl BatchPartitioner {
                     exprs,
                     num_partitions: partitions,
                     hash_buffer,
-                } => {
+                } => unsafe {
                     // Tracking time required for distributing indexes across output partitions
                     let timer = self.timer.timer();
 
@@ -278,114 +278,54 @@ impl BatchPartitioner {
 
                     create_hashes(&arrays, random_state, hash_buffer)?;
 
-                    // let mut indices_data = Vec::with_capacity(hash_buffer.len());
-                    // let mut offsets = vec![0; *partitions + 1];
-                    // let partitions_u64 = *partitions as u64; // 缓存类型转换结果
-                    //
-                    // // 第一轮遍历: 统计每个分区的元素数量
-                    // for h in hash_buffer.iter() {
-                    //     let p = (*h % partitions_u64) as usize; // 使用预转换的分区数
-                    //     offsets[p + 1] += 1;
-                    // }
-                    //
-                    // // 计算前缀和确定分区边界
-                    // for i in 1..=*partitions {
-                    //     offsets[i] += offsets[i - 1];
-                    // }
-                    //
-                    // // 安全地设置长度避免初始化
-                    // unsafe { indices_data.set_len(hash_buffer.len()) };
-                    //
-                    // // 初始化写入位置为各分区起始点
-                    // let mut write_pos = offsets[0..*partitions].to_vec(); // 直接克隆分区起始位置
-                    //
-                    // // 第二轮遍历: 正序填充数据
-                    // for (row_idx, h) in hash_buffer.iter().enumerate() {
-                    //     let p = (*h % partitions_u64) as usize;
-                    //     indices_data[write_pos[p]] = row_idx as u32; // 直接按顺序写入
-                    //     write_pos[p] += 1; // 移动写入指针
-                    // }
-                    //
-                    // // 转换为 Arrow Array（零拷贝）
-                    // let indices_array = UInt32Array::from(indices_data);
-                    //
-                    // timer.done();
-                    // let it = (0..*partitions).filter_map(move |partition| {
-                    //     let start = offsets[partition];
-                    //     let end = offsets[partition + 1];
-                    //     if start == end {
-                    //         return None;
-                    //     }
-                    //
-                    //     let partition_slice = indices_array.slice(start, end - start);
-                    //     let columns = take_arrays(batch.columns(), &partition_slice, None).unwrap();
-                    //
-                    //     let options = RecordBatchOptions::new().with_row_count(Some(partition_slice.len()));
-                    //     let batch = RecordBatch::try_new_with_options(
-                    //         batch.schema(),
-                    //         columns,
-                    //         &options
-                    //     ).unwrap();
-                    //
-                    //     Some(Ok((partition, batch)))
-                    // });
-                    //
-                    // Box::new(it)
-                    // 保持时间追踪逻辑
                     let timer = self.timer.timer();
 
-                    // 预计算分区数并转换类型
                     let num_partitions = *partitions;
                     let partitions_u64 = num_partitions as u64;
 
-                    // 1. 合并统计与初始化逻辑
                     let mut offsets = vec![0; num_partitions + 1];
 
-                    // 第一轮遍历：统计分区计数
                     hash_buffer.iter().for_each(|h| {
                         let p = (*h % partitions_u64) as usize;
                         offsets[p + 1] += 1;
                     });
 
-                    // 计算前缀和（原地操作）
                     (1..=num_partitions).for_each(|i| offsets[i] += offsets[i - 1]);
 
-                    // 2. 直接初始化带容量的UInt32Array（避免二次拷贝）
-                    let mut indices_data = UInt32Array::builder(hash_buffer.len());
+                    let mut indices_data = Vec::with_capacity(hash_buffer.len());
+                    unsafe{indices_data.set_len(hash_buffer.len());}
                     let mut write_pos = offsets.clone(); // 利用Rust的clone优化
 
-                    // 第二轮遍历：顺序填充索引
                     hash_buffer.iter().enumerate().for_each(|(row_idx, h)| {
                         let p = (*h % partitions_u64) as usize;
                         let pos = write_pos[p];
-                        indices_data.append_value(row_idx as u32);
+                        indices_data[pos] = row_idx as u32;
                         write_pos[p] = pos + 1;
                     });
 
-                    let indices_array = indices_data.finish();
+                    let indices_array = UInt32Array::from(indices_data);
 
+                    let non_empty_partitions: Vec<_> = (0..num_partitions)
+                        .filter_map(|p| {
+                            (offsets[p + 1] != offsets[p]).then(|| (p, offsets[p], offsets[p + 1] - offsets[p]))
+                        })
+                        .collect();
                     timer.done();
 
-                    // 3. 预生成非空分区列表（优化过滤逻辑）
-                    let non_empty_partitions: Vec<_> = (0..num_partitions)
-                        .filter(|&p| offsets[p] != offsets[p + 1])
-                        .collect();
+                    let partitioner_timer = &self.timer;
+                    Box::new(non_empty_partitions.into_iter().map(move |(partition, start, length)| {
+                        let _timer = partitioner_timer.timer();
+                        let partition_slice = indices_array.slice(start, length);
 
-                    // 4. 使用迭代器适配器处理结果
-                    Box::new(non_empty_partitions.into_iter().map(move |partition| {
-                        let start = offsets[partition];
-                        let end = offsets[partition + 1];
-                        let partition_slice = indices_array.slice(start, end - start);
-
-                        // 使用?操作符统一错误处理
-                        let columns = take_arrays(batch.columns(), &partition_slice, None)?;
+                        let columns =
+                            take_arrays(batch.columns(), &partition_slice, None)?;
 
                         let options = RecordBatchOptions::new()
                             .with_row_count(Some(partition_slice.len()));
                         let batch = RecordBatch::try_new_with_options(
                             batch.schema(),
                             columns,
-                            &options
+                            &options,
                         )?;
 
                         Ok((partition, batch))
