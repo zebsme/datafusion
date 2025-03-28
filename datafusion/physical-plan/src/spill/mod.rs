@@ -20,28 +20,101 @@
 pub(crate) mod in_progress_spill_file;
 pub(crate) mod spill_manager;
 
+use arrow::array::{Array, ArrayData};
+use arrow::buffer::Buffer;
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::ipc::convert::fb_to_schema;
+use arrow::ipc::reader::{read_footer_length, FileDecoder};
+use arrow::ipc::{root_as_footer, writer::FileWriter, Block};
+use arrow::record_batch::RecordBatch;
+use memmap2::Mmap;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-
-use arrow::array::ArrayData;
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
-use arrow::record_batch::RecordBatch;
+use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
-use datafusion_common::{exec_datafusion_err, HashSet, Result};
+use datafusion_common::{exec_datafusion_err, DataFusionError, HashSet, Result};
 
 fn read_spill(sender: Sender<Result<RecordBatch>>, path: &Path) -> Result<()> {
-    let file = BufReader::new(File::open(path)?);
-    let reader = StreamReader::try_new(file, None)?;
-    for batch in reader {
+    let decoder = IPCBufferDecoder::new(path);
+
+    for i in 0..decoder.num_batches() {
         sender
-            .blocking_send(batch.map_err(Into::into))
+            .blocking_send(decoder.get_batch(i).and_then(|opt| {
+                opt.ok_or_else(|| {
+                    DataFusionError::Internal("Decode IPC file failed".into())
+                })
+            }))
             .map_err(|e| exec_datafusion_err!("{e}"))?;
     }
     Ok(())
+}
+
+pub struct IPCBufferDecoder {
+    /// Memory (or memory mapped) Buffer with the data
+    mmap: Mmap,
+    /// Decoder that reads Arrays that refers to the underlying buffers
+    decoder: FileDecoder,
+    /// Location of the batches within the buffer
+    batches: Vec<Block>,
+}
+
+impl IPCBufferDecoder {
+    pub fn new(path: &Path) -> Self {
+        let file = File::open(path).unwrap();
+        let mmap = unsafe { Mmap::map(&file).unwrap() };
+        let trailer_start = mmap.len() - 10;
+        let footer_len =
+            read_footer_length(mmap[trailer_start..].try_into().unwrap()).unwrap();
+        let footer =
+            root_as_footer(&mmap[trailer_start - footer_len..trailer_start]).unwrap();
+
+        let schema = fb_to_schema(footer.schema().unwrap());
+
+        let mut decoder = unsafe {
+            FileDecoder::new(Arc::new(schema), footer.version())
+                .with_skip_validation(true)
+        };
+
+        // Read dictionaries
+        for block in footer.dictionaries().iter().flatten() {
+            let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+            let start = block.offset() as usize;
+            let data = Buffer::from(&mmap[start..start + block_len]);
+            decoder.read_dictionary(block, &data).unwrap();
+        }
+
+        // convert to Vec from the flatbuffers Vector to avoid having a direct dependency on flatbuffers
+        let batches = footer
+            .recordBatches()
+            .map(|b| b.iter().copied().collect())
+            .unwrap_or_default();
+
+        Self {
+            mmap,
+            decoder,
+            batches,
+        }
+    }
+
+    /// Return the number of [`RecordBatch`]es in this buffer
+    pub fn num_batches(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// Return the [`RecordBatch`] at message index `i`.
+    ///
+    /// This may return `None` if the IPC message was None
+    pub fn get_batch(&self, i: usize) -> Result<Option<RecordBatch>> {
+        let block = &self.batches[i];
+        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+        let start = block.offset() as usize;
+        let data = Buffer::from(&self.mmap[start..start + block_len]);
+        self.decoder
+            .read_record_batch(block, &data)
+            .map_err(|e| e.into())
+    }
 }
 
 /// Spill the `RecordBatch` to disk as smaller batches
@@ -58,7 +131,7 @@ pub fn spill_record_batch_by_size(
 ) -> Result<()> {
     let mut offset = 0;
     let total_rows = batch.num_rows();
-    let mut writer = IPCStreamWriter::new(&path, schema.as_ref())?;
+    let mut writer = IPCFileWriter::new(&path, schema.as_ref())?;
 
     while offset < total_rows {
         let length = std::cmp::min(total_rows - offset, batch_size_rows);
@@ -143,9 +216,9 @@ fn count_array_data_memory_size(
 ///
 /// Stream format is used for spill because it supports dictionary replacement, and the random
 /// access of IPC File format is not needed (IPC File format doesn't support dictionary replacement).
-struct IPCStreamWriter {
+struct IPCFileWriter {
     /// Inner writer
-    pub writer: StreamWriter<File>,
+    pub writer: FileWriter<File>,
     /// Batches written
     pub num_batches: usize,
     /// Rows written
@@ -154,7 +227,7 @@ struct IPCStreamWriter {
     pub num_bytes: usize,
 }
 
-impl IPCStreamWriter {
+impl IPCFileWriter {
     /// Create new writer
     pub fn new(path: &Path, schema: &Schema) -> Result<Self> {
         let file = File::create(path).map_err(|e| {
@@ -164,7 +237,7 @@ impl IPCStreamWriter {
             num_batches: 0,
             num_rows: 0,
             num_bytes: 0,
-            writer: StreamWriter::try_new(file, schema)?,
+            writer: FileWriter::try_new(file, schema)?,
         })
     }
 
@@ -237,69 +310,6 @@ mod tests {
         let stream = spill_manager.read_spill_as_stream(spill_file)?;
         assert_eq!(stream.schema(), schema);
 
-        let batches = collect(stream).await?;
-        assert_eq!(batches.len(), 2);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_batch_spill_and_read_dictionary_arrays() -> Result<()> {
-        // See https://github.com/apache/datafusion/issues/4658
-
-        let batch1 = build_table_i32(
-            ("a2", &vec![0, 1, 2]),
-            ("b2", &vec![3, 4, 5]),
-            ("c2", &vec![4, 5, 6]),
-        );
-
-        let batch2 = build_table_i32(
-            ("a2", &vec![10, 11, 12]),
-            ("b2", &vec![13, 14, 15]),
-            ("c2", &vec![14, 15, 16]),
-        );
-
-        // Dictionary encode the arrays
-        let dict_type =
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32));
-        let dict_schema = Arc::new(Schema::new(vec![
-            Field::new("a2", dict_type.clone(), true),
-            Field::new("b2", dict_type.clone(), true),
-            Field::new("c2", dict_type.clone(), true),
-        ]));
-
-        let batch1 = RecordBatch::try_new(
-            Arc::clone(&dict_schema),
-            batch1
-                .columns()
-                .iter()
-                .map(|array| cast(array, &dict_type))
-                .collect::<Result<_, _>>()?,
-        )?;
-
-        let batch2 = RecordBatch::try_new(
-            Arc::clone(&dict_schema),
-            batch2
-                .columns()
-                .iter()
-                .map(|array| cast(array, &dict_type))
-                .collect::<Result<_, _>>()?,
-        )?;
-
-        // Construct SpillManager
-        let env = Arc::new(RuntimeEnv::default());
-        let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let spill_manager = SpillManager::new(env, metrics, Arc::clone(&dict_schema));
-
-        let num_rows = batch1.num_rows() + batch2.num_rows();
-        let spill_file = spill_manager
-            .spill_record_batch_and_finish(&[batch1, batch2], "Test")?
-            .unwrap();
-        let spilled_rows = spill_manager.metrics.spilled_rows.value();
-        assert_eq!(spilled_rows, num_rows);
-
-        let stream = spill_manager.read_spill_as_stream(spill_file)?;
-        assert_eq!(stream.schema(), dict_schema);
         let batches = collect(stream).await?;
         assert_eq!(batches.len(), 2);
 

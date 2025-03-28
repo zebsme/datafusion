@@ -50,7 +50,8 @@ pub use crate::ordering::InputOrderMode;
 pub use crate::stream::EmptyRecordBatchStream;
 pub use crate::topk::TopK;
 pub use crate::visitor::{accept, visit_execution_plan, ExecutionPlanVisitor};
-
+pub use spill::spill_manager::SpillManager;
+pub use spill::IPCBufferDecoder;
 mod ordering;
 mod render_tree;
 mod topk;

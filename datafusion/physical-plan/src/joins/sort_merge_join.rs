@@ -24,8 +24,6 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Formatter;
-use std::fs::File;
-use std::io::BufReader;
 use std::mem::size_of;
 use std::ops::Range;
 use std::pin::Pin;
@@ -51,8 +49,8 @@ use crate::projection::{
 use crate::spill::spill_manager::SpillManager;
 use crate::{
     metrics, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-    ExecutionPlanProperties, PhysicalExpr, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream, Statistics,
+    ExecutionPlanProperties, IPCBufferDecoder, PhysicalExpr, PlanProperties,
+    RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 
 use arrow::array::{types::UInt64Type, *};
@@ -61,7 +59,6 @@ use arrow::compute::{
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
-use arrow::ipc::reader::StreamReader;
 use datafusion_common::{
     exec_err, internal_err, not_impl_err, plan_err, DataFusionError, HashSet, JoinSide,
     JoinType, Result,
@@ -2279,15 +2276,13 @@ fn fetch_right_columns_from_batch_by_idxs(
             let mut buffered_cols: Vec<ArrayRef> =
                 Vec::with_capacity(buffered_indices.len());
 
-            let file = BufReader::new(File::open(spill_file.path())?);
-            let reader = StreamReader::try_new(file, None)?;
+            let decoder = IPCBufferDecoder::new(spill_file.path());
 
-            for batch in reader {
-                batch?.columns().iter().for_each(|column| {
+            for i in 0..decoder.num_batches(){
+                decoder.get_batch(i)?.unwrap().columns().iter().for_each(|column| {
                     buffered_cols.extend(take(column, &buffered_indices, None))
                 });
             }
-
                 Ok(buffered_cols)
             }
         // Invalid combination

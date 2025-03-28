@@ -24,7 +24,7 @@ use arrow::array::RecordBatch;
 use datafusion_common::exec_datafusion_err;
 use datafusion_execution::disk_manager::RefCountedTempFile;
 
-use super::{spill_manager::SpillManager, IPCStreamWriter};
+use super::{spill_manager::SpillManager, IPCFileWriter};
 
 /// Represents an in-progress spill file used for writing `RecordBatch`es to disk, created by `SpillManager`.
 /// Caller is able to use this struct to incrementally append in-memory batches to
@@ -32,7 +32,7 @@ use super::{spill_manager::SpillManager, IPCStreamWriter};
 pub struct InProgressSpillFile {
     pub(crate) spill_writer: Arc<SpillManager>,
     /// Lazily initialized writer
-    writer: Option<IPCStreamWriter>,
+    writer: Option<IPCFileWriter>,
     /// Lazily initialized in-progress file, it will be moved out when the `finish` method is invoked
     in_progress_file: Option<RefCountedTempFile>,
 }
@@ -59,7 +59,7 @@ impl InProgressSpillFile {
         if self.writer.is_none() {
             let schema = batch.schema();
             if let Some(ref in_progress_file) = self.in_progress_file {
-                self.writer = Some(IPCStreamWriter::new(
+                self.writer = Some(IPCFileWriter::new(
                     in_progress_file.path(),
                     schema.as_ref(),
                 )?);
