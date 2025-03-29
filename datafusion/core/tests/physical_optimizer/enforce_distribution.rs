@@ -38,10 +38,10 @@ use datafusion_common::ScalarValue;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_expr::{JoinType, Operator};
 use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
-use datafusion_physical_expr::{HashPartitionMode, PhysicalExpr};
 use datafusion_physical_expr::{
     expressions::binary, expressions::lit, LexOrdering, PhysicalSortExpr,
 };
+use datafusion_physical_expr::{HashPartitionMode, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use datafusion_physical_optimizer::enforce_distribution::*;
 use datafusion_physical_optimizer::enforce_sorting::EnforceSorting;
