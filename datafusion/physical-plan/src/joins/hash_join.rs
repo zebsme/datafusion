@@ -82,7 +82,9 @@ use datafusion_physical_expr::equivalence::{
 use datafusion_physical_expr::{HashPartitionMode, PhysicalExprRef};
 use datafusion_physical_expr_common::datum::compare_op_for_nested;
 
+use crate::repartition::SELECTION_FIELD_NAME;
 use ahash::RandomState;
+use arrow_schema::Field;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use futures::{ready, Stream, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
@@ -855,6 +857,13 @@ impl ExecutionPlan for HashJoinExec {
             None => self.column_indices.clone(),
         };
 
+        let mut with_selection_vector = matches!(
+            self.cache.partitioning,
+            Partitioning::HashSelectionVector(_, _)
+        );
+        //FIXME: used for test in first draft
+        with_selection_vector = true;
+
         Ok(Box::pin(HashJoinStream {
             schema: self.schema(),
             on_right,
@@ -870,6 +879,8 @@ impl ExecutionPlan for HashJoinExec {
             batch_size,
             hashes_buffer: vec![],
             right_side_ordered: self.right.output_ordering().is_some(),
+            //FIXME:
+            with_selection_vector: true,
         }))
     }
 
@@ -1243,6 +1254,8 @@ struct HashJoinStream {
     hashes_buffer: Vec<u64>,
     /// Specifies whether the right side has an ordering to potentially preserve
     right_side_ordered: bool,
+    ///
+    with_selection_vector: bool,
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -1502,6 +1515,103 @@ impl HashJoinStream {
             state.offset,
         )?;
 
+        let (left_indices, right_indices) = if self.with_selection_vector {
+            //TODO: Add more logic
+            let selection_idx = state
+                .batch
+                .schema()
+                .index_of(SELECTION_FIELD_NAME)
+                .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+            let right_selection_array = state
+                .batch
+                .column(selection_idx)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Invalid selection vector type".to_string())
+                })?;
+
+            let selection_idx = build_side
+                .left_data
+                .batch()
+                .schema()
+                .index_of(SELECTION_FIELD_NAME)
+                .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+            let left_selection_array = build_side
+                .left_data
+                .batch()
+                .column(selection_idx)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("Invalid selection vector type".to_string())
+                })?;
+
+            let right_mask = BooleanArray::from(
+                right_indices
+                    .iter()
+                    .map(|opt_right_idx| {
+                        opt_right_idx.map_or(
+                            matches!(self.join_type, JoinType::Right | JoinType::Full),
+                            |right_idx| {
+                                if (right_idx as usize) < right_selection_array.len() {
+                                    right_selection_array.value(right_idx as usize)
+                                } else {
+                                    false
+                                }
+                            },
+                        )
+                    })
+                    .collect::<Vec<bool>>(),
+            );
+
+            let left_mask = BooleanArray::from(
+                left_indices
+                    .iter()
+                    .map(|opt_left_idx| {
+                        opt_left_idx.map_or(
+                            matches!(self.join_type, JoinType::Left | JoinType::Full),
+                            |left_idx| {
+                                if (left_idx as usize) < left_selection_array.len() {
+                                    left_selection_array.value(left_idx as usize)
+                                } else {
+                                    false
+                                }
+                            },
+                        )
+                    })
+                    .collect::<Vec<bool>>(),
+            );
+
+            let combined_mask = and(&left_mask, &right_mask)?;
+
+            let filtered_left = arrow::compute::filter(&left_indices, &combined_mask)?;
+            let filtered_right = arrow::compute::filter(&right_indices, &combined_mask)?;
+
+            let left_filtered = filtered_left
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Failed to downcast left indices".to_string(),
+                    )
+                })?
+                .clone();
+
+            let right_filtered = filtered_right
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Failed to downcast right indices".to_string(),
+                    )
+                })?
+                .clone();
+
+            (left_filtered, right_filtered)
+        } else {
+            (left_indices, right_indices)
+        };
         // apply join filter if exists
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
             apply_join_filter_to_indices(
@@ -1704,6 +1814,30 @@ mod tests {
         c: (&str, &Vec<i32>),
     ) -> Arc<dyn ExecutionPlan> {
         let batch = build_table_i32(a, b, c);
+        let schema = batch.schema();
+        TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap()
+    }
+
+    fn build_table_with_selection_vector(
+        a: (&str, &Vec<i32>),
+        b: (&str, &Vec<i32>),
+        c: Vec<bool>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = Schema::new(vec![
+            Field::new(a.0, DataType::Int32, false),
+            Field::new(b.0, DataType::Int32, false),
+            Field::new(SELECTION_FIELD_NAME, DataType::Boolean, false),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(a.1.clone())),
+                Arc::new(Int32Array::from(b.1.clone())),
+                Arc::new(BooleanArray::from(c.clone())),
+            ],
+        )
+        .unwrap();
         let schema = batch.schema();
         TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap()
     }
@@ -4262,6 +4396,82 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn zero_copy_hash_join_1() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        let left = build_table_with_selection_vector(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 5]), // this has a repetition
+            vec![true, true, true],
+        );
+        let right = build_table_with_selection_vector(
+            ("a2", &vec![10, 20, 30]),
+            ("b2", &vec![4, 5, 6]),
+            vec![true, true, true],
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
+        )];
+
+        let (columns, batches) =
+            join_collect(left, right, on, &JoinType::Inner, false, task_ctx).await?;
+
+        assert_eq!(columns, vec!["a1", "b1", "a2", "b2"]);
+
+        // Inner join output is expected to preserve both inputs order
+        allow_duplicates! {
+            assert_snapshot!(batches_to_string(&batches), @r#"
+            +----+----+----+----+
+            | a1 | b1 | a2 | b2 |
+            +----+----+----+----+
+            | 1  | 4  | 10 | 4  |
+            | 2  | 5  | 20 | 5  |
+            | 3  | 5  | 20 | 5  |
+            +----+----+----+----+
+                "#);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_copy_hash_join_2() -> Result<()> {
+        let task_ctx = Arc::new(TaskContext::default());
+        let left = build_table_with_selection_vector(
+            ("a1", &vec![1, 2, 3]),
+            ("b1", &vec![4, 5, 5]),
+            vec![true, true, false],
+        );
+        let right = build_table_with_selection_vector(
+            ("a2", &vec![10, 20, 30]),
+            ("b2", &vec![4, 5, 6]),
+            vec![true, true, true],
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b2", &right.schema())?) as _,
+        )];
+
+        let (columns, batches) =
+            join_collect(left, right, on, &JoinType::Inner, false, task_ctx).await?;
+
+        assert_eq!(columns, vec!["a1", "b1", "a2", "b2"]);
+
+        // Inner join output is expected to preserve both inputs order
+        allow_duplicates! {
+            assert_snapshot!(batches_to_string(&batches), @r#"
+            +----+----+----+----+
+            | a1 | b1 | a2 | b2 |
+            +----+----+----+----+
+            | 1  | 4  | 10 | 4  |
+            | 2  | 5  | 20 | 5  |
+            +----+----+----+----+
+                "#);
+        }
+
+        Ok(())
+    }
     /// Returns the column names on the schema
     fn columns(schema: &Schema) -> Vec<String> {
         schema.fields().iter().map(|f| f.name().clone()).collect()
