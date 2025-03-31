@@ -1180,8 +1180,8 @@ impl DefaultPhysicalPlanner {
                             PartitionMode::Auto,
                             null_equals_null,
                         )?)
-                }
-            } else {
+                    }
+                } else {
                     Arc::new(HashJoinExec::try_new(
                         physical_left,
                         physical_right,

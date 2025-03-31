@@ -600,7 +600,9 @@ pub(crate) fn swap_join_according_to_unboundedness(
         }
         (PartitionMode::Auto, _) => {
             // Use `PartitionMode::Partitioned` as default if `Auto` is selected.
-            hash_join.swap_inputs(PartitionMode::Partitioned(HashPartitionMode::HashPartitioned))
+            hash_join.swap_inputs(PartitionMode::Partitioned(
+                HashPartitionMode::HashPartitioned,
+            ))
         }
     }
 }
