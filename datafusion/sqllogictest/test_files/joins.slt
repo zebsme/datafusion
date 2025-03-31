@@ -3453,7 +3453,7 @@ physical_plan
 06)----------RepartitionExec: partitioning=Hash([a@0, b@1, c@2], 2), input_partitions=2
 07)------------AggregateExec: mode=Partial, gby=[a@0 as a, b@1 as b, c@2 as c], aggr=[last_value(r.b) ORDER BY [r.a ASC NULLS FIRST]]
 08)--------------CoalesceBatchesExec: target_batch_size=2
-09)----------------HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0)]
+09)----------------HashJoinExec: mode=Partitioned(HashPartitioned), join_type=Inner, on=[(a@0, a@0)]
 10)------------------CoalesceBatchesExec: target_batch_size=2
 11)--------------------RepartitionExec: partitioning=Hash([a@0], 2), input_partitions=2
 12)----------------------RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1

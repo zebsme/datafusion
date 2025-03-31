@@ -1152,17 +1152,36 @@ impl DefaultPhysicalPlanner {
                     && session_state.config().repartition_joins()
                     && prefer_hash_join
                 {
-                    Arc::new(HashJoinExec::try_new(
-                        physical_left,
-                        physical_right,
-                        join_on,
-                        join_filter,
-                        join_type,
-                        None,
-                        PartitionMode::Auto,
-                        null_equals_null,
-                    )?)
-                } else {
+                    if session_state
+                        .config_options()
+                        .optimizer
+                        .prefer_hash_selection_vector_partitioning_join
+                    {
+                        Arc::new(HashJoinExec::try_new(
+                            physical_left,
+                            physical_right,
+                            join_on,
+                            join_filter,
+                            join_type,
+                            None,
+                            PartitionMode::Partitioned(
+                                HashPartitionMode::SelectionVector,
+                            ),
+                            null_equals_null,
+                        )?)
+                    } else {
+                        Arc::new(HashJoinExec::try_new(
+                            physical_left,
+                            physical_right,
+                            join_on,
+                            join_filter,
+                            join_type,
+                            None,
+                            PartitionMode::Auto,
+                            null_equals_null,
+                        )?)
+                }
+            } else {
                     Arc::new(HashJoinExec::try_new(
                         physical_left,
                         physical_right,
