@@ -872,6 +872,11 @@ impl ExecutionPlan for HashJoinExec {
             None => self.column_indices.clone(),
         };
 
+        let with_selection_vector = matches!(
+            self.cache.partitioning,
+            Partitioning::HashSelectionVector(_, _)
+        );
+
         Ok(Box::pin(HashJoinStream {
             schema: self.schema(),
             on_right,
@@ -887,6 +892,7 @@ impl ExecutionPlan for HashJoinExec {
             batch_size,
             hashes_buffer: vec![],
             right_side_ordered: self.right.output_ordering().is_some(),
+            with_selection_vector,
         }))
     }
 
@@ -1260,6 +1266,8 @@ struct HashJoinStream {
     hashes_buffer: Vec<u64>,
     /// Specifies whether the right side has an ordering to potentially preserve
     right_side_ordered: bool,
+    /// Use selection vector to filter or not
+    with_selection_vector: bool,
 }
 
 impl RecordBatchStream for HashJoinStream {
