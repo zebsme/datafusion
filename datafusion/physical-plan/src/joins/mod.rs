@@ -19,6 +19,7 @@
 
 use arrow::array::BooleanBufferBuilder;
 pub use cross_join::CrossJoinExec;
+use datafusion_physical_expr::HashPartitionMode;
 pub use hash_join::HashJoinExec;
 pub use nested_loop_join::NestedLoopJoinExec;
 use parking_lot::Mutex;
@@ -43,7 +44,7 @@ pub mod test_utils;
 /// Hash join Partitioning mode
 pub enum PartitionMode {
     /// Left/right children are partitioned using the left and right keys
-    Partitioned,
+    Partitioned(HashPartitionMode),
     /// Left side will collected into one partition
     CollectLeft,
     /// DataFusion optimizer decides which PartitionMode

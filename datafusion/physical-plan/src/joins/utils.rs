@@ -58,6 +58,7 @@ use datafusion_physical_expr::{
 
 use crate::joins::SharedBitmapBuilder;
 use crate::projection::ProjectionExec;
+use crate::repartition::SELECTION_FIELD_NAME;
 use futures::future::{BoxFuture, Shared};
 use futures::{ready, FutureExt};
 use parking_lot::Mutex;
@@ -269,6 +270,7 @@ pub fn build_join_schema(
     let left_fields = || {
         left.fields()
             .iter()
+            .filter(|f| f.name() != SELECTION_FIELD_NAME)
             .map(|f| output_join_field(f, join_type, true))
             .enumerate()
             .map(|(index, f)| {
@@ -286,6 +288,7 @@ pub fn build_join_schema(
         right
             .fields()
             .iter()
+            .filter(|f| f.name() != SELECTION_FIELD_NAME)
             .map(|f| output_join_field(f, join_type, false))
             .enumerate()
             .map(|(index, f)| {

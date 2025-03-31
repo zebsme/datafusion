@@ -79,7 +79,7 @@ use datafusion_expr::Operator;
 use datafusion_physical_expr::equivalence::{
     join_equivalence_properties, ProjectionMapping,
 };
-use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_physical_expr::{HashPartitionMode, PhysicalExprRef};
 use datafusion_physical_expr_common::datum::compare_op_for_nested;
 
 use ahash::RandomState;
@@ -538,7 +538,7 @@ impl HashJoinExec {
             PartitionMode::Auto => Partitioning::UnknownPartitioning(
                 right.output_partitioning().partition_count(),
             ),
-            PartitionMode::Partitioned => {
+            PartitionMode::Partitioned(_) => {
                 symmetric_join_output_partitioning(left, right, &join_type)
             }
         };
@@ -708,15 +708,38 @@ impl ExecutionPlan for HashJoinExec {
                 Distribution::SinglePartition,
                 Distribution::UnspecifiedDistribution,
             ],
-            PartitionMode::Partitioned => {
+            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned) => {
                 let (left_expr, right_expr) = self
                     .on
                     .iter()
                     .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
                     .unzip();
                 vec![
-                    Distribution::HashPartitioned(left_expr),
-                    Distribution::HashPartitioned(right_expr),
+                    Distribution::HashPartitioned(
+                        left_expr,
+                        HashPartitionMode::HashPartitioned,
+                    ),
+                    Distribution::HashPartitioned(
+                        right_expr,
+                        HashPartitionMode::HashPartitioned,
+                    ),
+                ]
+            }
+            PartitionMode::Partitioned(HashPartitionMode::SelectionVector) => {
+                let (left_expr, right_expr) = self
+                    .on
+                    .iter()
+                    .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
+                    .unzip();
+                vec![
+                    Distribution::HashPartitioned(
+                        left_expr,
+                        HashPartitionMode::SelectionVector,
+                    ),
+                    Distribution::HashPartitioned(
+                        right_expr,
+                        HashPartitionMode::SelectionVector,
+                    ),
                 ]
             }
             PartitionMode::Auto => vec![
@@ -784,7 +807,8 @@ impl ExecutionPlan for HashJoinExec {
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
 
-        if self.mode == PartitionMode::Partitioned && left_partitions != right_partitions
+        if matches!(self.mode, PartitionMode::Partitioned(_))
+            && left_partitions != right_partitions
         {
             return internal_err!(
                 "Invalid HashJoinExec, partition count mismatch {left_partitions}!={right_partitions},\
@@ -809,7 +833,7 @@ impl ExecutionPlan for HashJoinExec {
                     self.right().output_partitioning().partition_count(),
                 )
             }),
-            PartitionMode::Partitioned => {
+            PartitionMode::Partitioned(_) => {
                 let reservation =
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
                         .register(context.memory_pool());
@@ -849,6 +873,11 @@ impl ExecutionPlan for HashJoinExec {
             None => self.column_indices.clone(),
         };
 
+        let with_selection_vector = matches!(
+            self.cache.partitioning,
+            Partitioning::HashSelectionVector(_, _)
+        );
+
         Ok(Box::pin(HashJoinStream {
             schema: self.schema(),
             on_right,
@@ -864,6 +893,7 @@ impl ExecutionPlan for HashJoinExec {
             batch_size,
             hashes_buffer: vec![],
             right_side_ordered: self.right.output_ordering().is_some(),
+            with_selection_vector,
         }))
     }
 
@@ -1237,6 +1267,8 @@ struct HashJoinStream {
     hashes_buffer: Vec<u64>,
     /// Specifies whether the right side has an ordering to potentially preserve
     right_side_ordered: bool,
+    /// Use selection vector to filter or not
+    with_selection_vector: bool,
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -1771,7 +1803,7 @@ mod tests {
             right,
             on,
             join_type,
-            PartitionMode::Partitioned,
+            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             null_equals_null,
             context,
         )
@@ -1796,7 +1828,7 @@ mod tests {
 
         let left_repartitioned: Arc<dyn ExecutionPlan> = match partition_mode {
             PartitionMode::CollectLeft => Arc::new(CoalescePartitionsExec::new(left)),
-            PartitionMode::Partitioned => Arc::new(RepartitionExec::try_new(
+            PartitionMode::Partitioned(_) => Arc::new(RepartitionExec::try_new(
                 left,
                 Partitioning::Hash(left_expr, partition_count),
             )?),
@@ -1817,10 +1849,18 @@ mod tests {
                     Partitioning::Hash(partition_expr, partition_count),
                 )?) as _
             }
-            PartitionMode::Partitioned => Arc::new(RepartitionExec::try_new(
-                right,
-                Partitioning::Hash(right_expr, partition_count),
-            )?),
+            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned) => {
+                Arc::new(RepartitionExec::try_new(
+                    right,
+                    Partitioning::Hash(right_expr, partition_count),
+                )?)
+            }
+            PartitionMode::Partitioned(HashPartitionMode::SelectionVector) => {
+                Arc::new(RepartitionExec::try_new(
+                    right,
+                    Partitioning::HashSelectionVector(right_expr, partition_count),
+                )?)
+            }
             PartitionMode::Auto => {
                 return internal_err!("Unexpected PartitionMode::Auto in join tests")
             }
@@ -4133,7 +4173,7 @@ mod tests {
                 None,
                 &join_type,
                 None,
-                PartitionMode::Partitioned,
+                PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
                 false,
             )?;
 
