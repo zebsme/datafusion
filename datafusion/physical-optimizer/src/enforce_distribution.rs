@@ -302,7 +302,7 @@ pub fn adjust_input_keys_ordering(
     }) = plan.as_any().downcast_ref::<HashJoinExec>()
     {
         match mode {
-            PartitionMode::Partitioned => {
+            PartitionMode::Partitioned(_) => {
                 let join_constructor = |new_conditions: (
                     Vec<(PhysicalExprRef, PhysicalExprRef)>,
                     Vec<SortOptions>,
@@ -315,7 +315,7 @@ pub fn adjust_input_keys_ordering(
                         join_type,
                         // TODO: although projection is not used in the join here, because projection pushdown is after enforce_distribution. Maybe we need to handle it later. Same as filter.
                         projection.clone(),
-                        PartitionMode::Partitioned,
+                        mode.clone(),
                         *null_equals_null,
                     )
                     .map(|e| Arc::new(e) as _)
@@ -624,7 +624,7 @@ pub fn reorder_join_keys_to_inputs(
         ..
     }) = plan_any.downcast_ref::<HashJoinExec>()
     {
-        if matches!(mode, PartitionMode::Partitioned) {
+        if matches!(mode, PartitionMode::Partitioned(_)) {
             let (join_keys, positions) = reorder_current_join_keys(
                 extract_join_keys(on),
                 Some(left.output_partitioning()),
@@ -645,7 +645,7 @@ pub fn reorder_join_keys_to_inputs(
                     filter.clone(),
                     join_type,
                     projection.clone(),
-                    PartitionMode::Partitioned,
+                    mode.clone(),
                     *null_equals_null,
                 )?));
             }

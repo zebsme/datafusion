@@ -22,6 +22,7 @@ pub use cross_join::CrossJoinExec;
 pub use hash_join::HashJoinExec;
 pub use nested_loop_join::NestedLoopJoinExec;
 use parking_lot::Mutex;
+use datafusion_physical_expr::HashPartitionMode;
 // Note: SortMergeJoin is not used in plans yet
 pub use sort_merge_join::SortMergeJoinExec;
 pub use symmetric_hash_join::SymmetricHashJoinExec;
@@ -43,7 +44,7 @@ pub mod test_utils;
 /// Hash join Partitioning mode
 pub enum PartitionMode {
     /// Left/right children are partitioned using the left and right keys
-    Partitioned,
+    Partitioned(HashPartitionMode),
     /// Left side will collected into one partition
     CollectLeft,
     /// DataFusion optimizer decides which PartitionMode
