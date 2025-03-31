@@ -49,7 +49,9 @@ use datafusion::datasource::file_format::parquet::ParquetSink;
 use datafusion::datasource::physical_plan::AvroSource;
 #[cfg(feature = "parquet")]
 use datafusion::datasource::physical_plan::ParquetSource;
-use datafusion::datasource::physical_plan::{CsvSource, FileScanConfig, JsonSource};
+use datafusion::datasource::physical_plan::{
+    CsvSource, FileScanConfig, FileScanConfigBuilder, JsonSource,
+};
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -238,15 +240,16 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
                     .with_comment(comment),
                 );
 
-                let conf = parse_protobuf_file_scan_config(
+                let conf = FileScanConfigBuilder::from(parse_protobuf_file_scan_config(
                     scan.base_conf.as_ref().unwrap(),
                     registry,
                     extension_codec,
                     source,
-                )?
+                )?)
                 .with_newlines_in_values(scan.newlines_in_values)
-                .with_file_compression_type(FileCompressionType::UNCOMPRESSED);
-                Ok(conf.build())
+                .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
+                .build();
+                Ok(DataSourceExec::from_data_source(conf))
             }
             PhysicalPlanType::JsonScan(scan) => {
                 let scan_conf = parse_protobuf_file_scan_config(
@@ -255,7 +258,7 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
                     extension_codec,
                     Arc::new(JsonSource::new()),
                 )?;
-                Ok(scan_conf.build())
+                Ok(DataSourceExec::from_data_source(scan_conf))
             }
             #[cfg_attr(not(feature = "parquet"), allow(unused_variables))]
             PhysicalPlanType::ParquetScan(scan) => {
@@ -292,7 +295,7 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
                         extension_codec,
                         Arc::new(source),
                     )?;
-                    Ok(base_config.build())
+                    Ok(DataSourceExec::from_data_source(base_config))
                 }
                 #[cfg(not(feature = "parquet"))]
                 panic!("Unable to process a Parquet PhysicalPlan when `parquet` feature is not enabled")
@@ -307,7 +310,7 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
                         extension_codec,
                         Arc::new(AvroSource::new()),
                     )?;
-                    Ok(conf.build())
+                    Ok(DataSourceExec::from_data_source(conf))
                 }
                 #[cfg(not(feature = "avro"))]
                 panic!("Unable to process a Avro PhysicalPlan when `avro` feature is not enabled")
@@ -681,7 +684,10 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
                 })?;
                 let partition_mode = match partition_mode {
                     protobuf::PartitionMode::CollectLeft => PartitionMode::CollectLeft,
-                    protobuf::PartitionMode::Partitioned => PartitionMode::Partitioned,
+                    //TODO: add selectionvector
+                    protobuf::PartitionMode::Partitioned => {
+                        PartitionMode::Partitioned(HashPartitionMode::HashPartitioned)
+                    }
                     protobuf::PartitionMode::Auto => PartitionMode::Auto,
                 };
                 let projection = if !hashjoin.projection.is_empty() {
@@ -1368,7 +1374,7 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
 
             let partition_mode = match exec.partition_mode() {
                 PartitionMode::CollectLeft => protobuf::PartitionMode::CollectLeft,
-                PartitionMode::Partitioned => protobuf::PartitionMode::Partitioned,
+                PartitionMode::Partitioned(_) => protobuf::PartitionMode::Partitioned,
                 PartitionMode::Auto => protobuf::PartitionMode::Auto,
             };
 

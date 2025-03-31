@@ -40,7 +40,7 @@ use datafusion_physical_expr::expressions::{binary, cast, col, lit};
 use datafusion_physical_expr::intervals::test_utils::{
     gen_conjunctive_numerical_expr, gen_conjunctive_temporal_expr,
 };
-use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
+use datafusion_physical_expr::{HashPartitionMode, LexOrdering, PhysicalExpr};
 
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
@@ -152,7 +152,7 @@ pub async fn partitioned_hash_join_with_filter(
         filter,
         join_type,
         None,
-        PartitionMode::Partitioned,
+        PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
         null_equals_null,
     )?);
 

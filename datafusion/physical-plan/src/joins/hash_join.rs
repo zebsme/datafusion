@@ -69,10 +69,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
 use datafusion_common::utils::memory::estimate_memory_size;
-use datafusion_common::{
-    internal_datafusion_err, internal_err, plan_err, project_schema, DataFusionError,
-    JoinSide, JoinType, Result,
-};
+use datafusion_common::{internal_datafusion_err, internal_err, plan_err, project_schema, DataFusionError, HashSet, JoinSide, JoinType, Result};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
@@ -710,45 +707,42 @@ impl ExecutionPlan for HashJoinExec {
                 Distribution::SinglePartition,
                 Distribution::UnspecifiedDistribution,
             ],
-            PartitionMode::Partitioned(mode) => {
-                match mode {
-                    HashPartitionMode::SelectionVector => {
-                        let (left_expr, right_expr) = self
-                            .on
-                            .iter()
-                            .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
-                            .unzip();
-                        vec![
-                            Distribution::HashPartitioned(
-                                left_expr,
-                                HashPartitionMode::SelectionVector,
-                            ),
-                            Distribution::HashPartitioned(
-                                right_expr,
-                                HashPartitionMode::SelectionVector,
-                            ),
-                            ]
-                    }
-                    HashPartitionMode::HashPartitioned => {
-                        let (left_expr, right_expr) = self
-                            .on
-                            .iter()
-                            .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
-                            .unzip();
-                        vec![
-                            Distribution::HashPartitioned(
-                                left_expr,
-                                HashPartitionMode::HashPartitioned,
-                            ),
-                            Distribution::HashPartitioned(
-                                right_expr,
-                                HashPartitionMode::HashPartitioned,
-                            ),
-                        ]
-                    }
+            PartitionMode::Partitioned(mode) => match mode {
+                HashPartitionMode::SelectionVector => {
+                    let (left_expr, right_expr) = self
+                        .on
+                        .iter()
+                        .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
+                        .unzip();
+                    vec![
+                        Distribution::HashPartitioned(
+                            left_expr,
+                            HashPartitionMode::SelectionVector,
+                        ),
+                        Distribution::HashPartitioned(
+                            right_expr,
+                            HashPartitionMode::SelectionVector,
+                        ),
+                    ]
                 }
-
-            }
+                HashPartitionMode::HashPartitioned => {
+                    let (left_expr, right_expr) = self
+                        .on
+                        .iter()
+                        .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
+                        .unzip();
+                    vec![
+                        Distribution::HashPartitioned(
+                            left_expr,
+                            HashPartitionMode::HashPartitioned,
+                        ),
+                        Distribution::HashPartitioned(
+                            right_expr,
+                            HashPartitionMode::HashPartitioned,
+                        ),
+                    ]
+                }
+            },
             PartitionMode::Auto => vec![
                 Distribution::UnspecifiedDistribution,
                 Distribution::UnspecifiedDistribution,
@@ -814,7 +808,8 @@ impl ExecutionPlan for HashJoinExec {
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
 
-        if matches!(self.mode, PartitionMode::Partitioned(_)) && left_partitions != right_partitions
+        if matches!(self.mode, PartitionMode::Partitioned(_))
+            && left_partitions != right_partitions
         {
             return internal_err!(
                 "Invalid HashJoinExec, partition count mismatch {left_partitions}!={right_partitions},\
@@ -886,8 +881,8 @@ impl ExecutionPlan for HashJoinExec {
         //FIXME: used for test in first draft
         // with_selection_vector = true;
 
-        //Remove this
-        assert_eq!(with_selection_vector, true);
+        // //Remove this
+        // assert_eq!(with_selection_vector, true);
         Ok(Box::pin(HashJoinStream {
             schema: self.schema(),
             on_right,
@@ -904,7 +899,7 @@ impl ExecutionPlan for HashJoinExec {
             hashes_buffer: vec![],
             right_side_ordered: self.right.output_ordering().is_some(),
             //FIXME:
-            with_selection_vector: with_selection_vector,
+            with_selection_vector,
         }))
     }
 
@@ -1540,99 +1535,89 @@ impl HashJoinStream {
         )?;
 
         let (left_indices, right_indices) = if self.with_selection_vector {
-            //TODO: Add more logic
-            let selection_idx = state
-                .batch
-                .schema()
-                .index_of(SELECTION_FIELD_NAME)
-                .map_err(|e| DataFusionError::Internal(e.to_string()))?;
-            let right_selection_array = state
-                .batch
-                .column(selection_idx)
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Invalid selection vector type".to_string())
-                })?;
 
-            let selection_idx = build_side
-                .left_data
-                .batch()
-                .schema()
-                .index_of(SELECTION_FIELD_NAME)
-                .map_err(|e| DataFusionError::Internal(e.to_string()))?;
-            let left_selection_array = build_side
-                .left_data
-                .batch()
-                .column(selection_idx)
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Invalid selection vector type".to_string())
-                })?;
-
-            let right_mask = BooleanArray::from(
-                right_indices
-                    .iter()
-                    .map(|opt_right_idx| {
-                        opt_right_idx.map_or(
-                            matches!(self.join_type, JoinType::Right | JoinType::Full),
-                            |right_idx| {
-                                if (right_idx as usize) < right_selection_array.len() {
-                                    right_selection_array.value(right_idx as usize)
-                                } else {
-                                    false
-                                }
-                            },
+                let right_selection_array = match state.batch.schema().index_of(SELECTION_FIELD_NAME) {
+                    Ok(idx) => {
+                        Some(
+                            state.batch.column(idx)
+                                .as_any()
+                                .downcast_ref::<BooleanArray>()
+                                .ok_or_else(|| DataFusionError::Internal("Invalid selection vector type".to_string()))?
                         )
-                    })
-                    .collect::<Vec<bool>>(),
-            );
+                    }
+                    Err(_) => None,
+                };
 
-            let left_mask = BooleanArray::from(
-                left_indices
-                    .iter()
-                    .map(|opt_left_idx| {
-                        opt_left_idx.map_or(
-                            matches!(self.join_type, JoinType::Left | JoinType::Full),
-                            |left_idx| {
-                                if (left_idx as usize) < left_selection_array.len() {
-                                    left_selection_array.value(left_idx as usize)
-                                } else {
-                                    false
-                                }
-                            },
+                let left_selection_array = match build_side.left_data.batch().schema().index_of(SELECTION_FIELD_NAME) {
+                    Ok(idx) => {
+                        Some(
+                            build_side.left_data.batch().column(idx)
+                                .as_any()
+                                .downcast_ref::<BooleanArray>()
+                                .ok_or_else(|| DataFusionError::Internal("Invalid selection vector type".to_string()))?
                         )
-                    })
-                    .collect::<Vec<bool>>(),
-            );
+                    }
+                    Err(_) => None,
+                };
 
-            let combined_mask = and(&left_mask, &right_mask)?;
-
-            let filtered_left = arrow::compute::filter(&left_indices, &combined_mask)?;
-            let filtered_right = arrow::compute::filter(&right_indices, &combined_mask)?;
-
-            let left_filtered = filtered_left
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "Failed to downcast left indices".to_string(),
+                let right_mask = if let Some(sel_array) = right_selection_array {
+                    BooleanArray::from(
+                        right_indices.iter().map(|opt_right_idx| {
+                            opt_right_idx.map_or(
+                                true,
+                                |right_idx| {
+                                    if (right_idx as usize) < sel_array.len() {
+                                        sel_array.value(right_idx as usize)
+                                    } else {
+                                        false
+                                    }
+                                }
+                            )
+                        }).collect::<Vec<bool>>()
                     )
-                })?
-                .clone();
+                } else {
+                    BooleanArray::from(vec![true; right_indices.len()])
+                };
 
-            let right_filtered = filtered_right
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "Failed to downcast right indices".to_string(),
+                let left_mask = if let Some(sel_array) = left_selection_array {
+                    BooleanArray::from(
+                        left_indices.iter().map(|opt_left_idx| {
+                            opt_left_idx.map_or(
+                                true,
+                                |left_idx| {
+                                    if (left_idx as usize) < sel_array.len() {
+                                        sel_array.value(left_idx as usize)
+                                    } else {
+                                        false
+                                    }
+                                }
+                            )
+                        }).collect::<Vec<bool>>()
                     )
-                })?
-                .clone();
+                } else {
+                    BooleanArray::from(vec![true; left_indices.len()])
+                };
 
-            (left_filtered, right_filtered)
+                let combined_mask = and(&left_mask, &right_mask)?;
+                assert_eq!(left_indices.len(), right_indices.len());
+
+                let filtered_left = arrow::compute::filter(&left_indices, &combined_mask)?;
+                let filtered_right = arrow::compute::filter(&right_indices, &combined_mask)?;
+
+                let left_filtered = filtered_left
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| DataFusionError::Internal("Failed to downcast left indices".to_string()))?
+                    .clone();
+
+                let right_filtered = filtered_right
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| DataFusionError::Internal("Failed to downcast right indices".to_string()))?
+                    .clone();
+
+            assert_eq!(left_filtered.len(), right_filtered.len());
+                (left_filtered, right_filtered)
         } else {
             (left_indices, right_indices)
         };
@@ -1960,14 +1945,18 @@ mod tests {
 
         let left_repartitioned: Arc<dyn ExecutionPlan> = match partition_mode {
             PartitionMode::CollectLeft => Arc::new(CoalescePartitionsExec::new(left)),
-            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned) => Arc::new(RepartitionExec::try_new(
-                left,
-                Partitioning::Hash(left_expr, partition_count),
-            )?),
-            PartitionMode::Partitioned(HashPartitionMode::SelectionVector) => Arc::new(RepartitionExec::try_new(
-                left,
-                Partitioning::Hash(left_expr, partition_count),
-            )?),
+            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned) => {
+                Arc::new(RepartitionExec::try_new(
+                    left,
+                    Partitioning::Hash(left_expr, partition_count),
+                )?)
+            }
+            PartitionMode::Partitioned(HashPartitionMode::SelectionVector) => {
+                Arc::new(RepartitionExec::try_new(
+                    left,
+                    Partitioning::Hash(left_expr, partition_count),
+                )?)
+            }
             PartitionMode::Auto => {
                 return internal_err!("Unexpected PartitionMode::Auto in join tests")
             }
@@ -1985,14 +1974,18 @@ mod tests {
                     Partitioning::Hash(partition_expr, partition_count),
                 )?) as _
             }
-            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned) => Arc::new(RepartitionExec::try_new(
-                right,
-                Partitioning::Hash(right_expr, partition_count),
-            )?),
-            PartitionMode::Partitioned(HashPartitionMode::SelectionVector) => Arc::new(RepartitionExec::try_new(
-                right,
-                Partitioning::HashSelectionVector(right_expr, partition_count),
-            )?),
+            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned) => {
+                Arc::new(RepartitionExec::try_new(
+                    right,
+                    Partitioning::Hash(right_expr, partition_count),
+                )?)
+            }
+            PartitionMode::Partitioned(HashPartitionMode::SelectionVector) => {
+                Arc::new(RepartitionExec::try_new(
+                    right,
+                    Partitioning::HashSelectionVector(right_expr, partition_count),
+                )?)
+            }
             PartitionMode::Auto => {
                 return internal_err!("Unexpected PartitionMode::Auto in join tests")
             }

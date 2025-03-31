@@ -33,7 +33,7 @@ use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{internal_err, JoinSide, JoinType};
 use datafusion_expr_common::sort_properties::SortProperties;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::LexOrdering;
+use datafusion_physical_expr::{HashPartitionMode, LexOrdering};
 use datafusion_physical_plan::execution_plan::EmissionType;
 use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion_physical_plan::joins::{
@@ -282,18 +282,43 @@ pub(crate) fn partitioned_hash_join(
     let right = hash_join.right();
     if hash_join.join_type().supports_swap() && should_swap_join_order(&**left, &**right)?
     {
-        hash_join.swap_inputs(PartitionMode::Partitioned)
+        if hash_join.mode
+            == PartitionMode::Partitioned(HashPartitionMode::SelectionVector)
+        {
+            hash_join.swap_inputs(PartitionMode::Partitioned(
+                HashPartitionMode::SelectionVector,
+            ))
+        } else {
+            hash_join.swap_inputs(PartitionMode::Partitioned(
+                HashPartitionMode::HashPartitioned,
+            ))
+        }
     } else {
-        Ok(Arc::new(HashJoinExec::try_new(
-            Arc::clone(left),
-            Arc::clone(right),
-            hash_join.on().to_vec(),
-            hash_join.filter().cloned(),
-            hash_join.join_type(),
-            hash_join.projection.clone(),
-            PartitionMode::Partitioned,
-            hash_join.null_equals_null(),
-        )?))
+        if hash_join.mode
+            == PartitionMode::Partitioned(HashPartitionMode::SelectionVector)
+        {
+            Ok(Arc::new(HashJoinExec::try_new(
+                Arc::clone(left),
+                Arc::clone(right),
+                hash_join.on().to_vec(),
+                hash_join.filter().cloned(),
+                hash_join.join_type(),
+                hash_join.projection.clone(),
+                PartitionMode::Partitioned(HashPartitionMode::SelectionVector),
+                hash_join.null_equals_null(),
+            )?))
+        } else {
+            Ok(Arc::new(HashJoinExec::try_new(
+                Arc::clone(left),
+                Arc::clone(right),
+                hash_join.on().to_vec(),
+                hash_join.filter().cloned(),
+                hash_join.join_type(),
+                hash_join.projection.clone(),
+                PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
+                hash_join.null_equals_null(),
+            )?))
+        }
     }
 }
 
@@ -322,14 +347,14 @@ fn statistical_join_selection_subrule(
                         || partitioned_hash_join(hash_join).map(Some),
                         |v| Ok(Some(v)),
                     )?,
-                PartitionMode::Partitioned => {
+                PartitionMode::Partitioned(_) => {
                     let left = hash_join.left();
                     let right = hash_join.right();
                     if hash_join.join_type().supports_swap()
                         && should_swap_join_order(&**left, &**right)?
                     {
                         hash_join
-                            .swap_inputs(PartitionMode::Partitioned)
+                            .swap_inputs(hash_join.partition_mode().clone())
                             .map(Some)?
                     } else {
                         None
@@ -564,15 +589,22 @@ pub(crate) fn swap_join_according_to_unboundedness(
             _,
             JoinType::Right | JoinType::RightSemi | JoinType::RightAnti | JoinType::Full,
         ) => internal_err!("{join_type} join cannot be swapped for unbounded input."),
-        (PartitionMode::Partitioned, _) => {
-            hash_join.swap_inputs(PartitionMode::Partitioned)
-        }
+        (PartitionMode::Partitioned(HashPartitionMode::HashPartitioned), _) => hash_join
+            .swap_inputs(PartitionMode::Partitioned(
+                HashPartitionMode::HashPartitioned,
+            )),
+        (PartitionMode::Partitioned(HashPartitionMode::SelectionVector), _) => hash_join
+            .swap_inputs(PartitionMode::Partitioned(
+                HashPartitionMode::SelectionVector,
+            )),
         (PartitionMode::CollectLeft, _) => {
             hash_join.swap_inputs(PartitionMode::CollectLeft)
         }
         (PartitionMode::Auto, _) => {
             // Use `PartitionMode::Partitioned` as default if `Auto` is selected.
-            hash_join.swap_inputs(PartitionMode::Partitioned)
+            hash_join.swap_inputs(PartitionMode::Partitioned(
+                HashPartitionMode::HashPartitioned,
+            ))
         }
     }
 }

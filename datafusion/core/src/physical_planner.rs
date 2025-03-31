@@ -1164,7 +1164,9 @@ impl DefaultPhysicalPlanner {
                             join_filter,
                             join_type,
                             None,
-                            PartitionMode::Partitioned(HashPartitionMode::SelectionVector),
+                            PartitionMode::Partitioned(
+                                HashPartitionMode::SelectionVector,
+                            ),
                             null_equals_null,
                         )?)
                     } else {
@@ -1178,7 +1180,7 @@ impl DefaultPhysicalPlanner {
                             PartitionMode::Auto,
                             null_equals_null,
                         )?)
-                    };
+                    }
                 } else {
                     Arc::new(HashJoinExec::try_new(
                         physical_left,

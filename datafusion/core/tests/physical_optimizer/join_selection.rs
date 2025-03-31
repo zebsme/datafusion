@@ -33,8 +33,8 @@ use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::col;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column, NegativeExpr};
 use datafusion_physical_expr::intervals::utils::check_support;
-use datafusion_physical_expr::{HashPartitionMode, PhysicalExprRef};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{HashPartitionMode, PhysicalExprRef};
 use datafusion_physical_optimizer::join_selection::{
     hash_join_swap_subrule, JoinSelection,
 };
@@ -646,7 +646,9 @@ async fn test_hash_join_swap_on_joins_with_projections(
     )?);
 
     let swapped = join
-        .swap_inputs(PartitionMode::Partitioned(HashPartitionMode::HashPartitioned))
+        .swap_inputs(PartitionMode::Partitioned(
+            HashPartitionMode::HashPartitioned,
+        ))
         .expect("swap_hash_join must support joins with projections");
     let swapped_join = swapped.as_any().downcast_ref::<HashJoinExec>().expect(
             "ProjectionExec won't be added above if HashJoinExec contains embedded projection",
@@ -784,7 +786,13 @@ async fn test_join_selection_partitioned() {
         Arc::new(Column::new_with_schema("big_col", &big.schema()).unwrap()) as _,
         Arc::new(Column::new_with_schema("empty_col", &empty.schema()).unwrap()) as _,
     )];
-    check_join_partition_mode(big, empty, join_on, false, PartitionMode::Partitioned(HashPartitionMode::HashPartitioned));
+    check_join_partition_mode(
+        big,
+        empty,
+        join_on,
+        false,
+        PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
+    );
 }
 
 fn check_join_partition_mode(

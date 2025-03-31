@@ -58,10 +58,10 @@ use datafusion_physical_expr::{
 
 use crate::joins::SharedBitmapBuilder;
 use crate::projection::ProjectionExec;
+use crate::repartition::SELECTION_FIELD_NAME;
 use futures::future::{BoxFuture, Shared};
 use futures::{ready, FutureExt};
 use parking_lot::Mutex;
-use crate::repartition::SELECTION_FIELD_NAME;
 
 /// The on clause of the join, as vector of (left, right) columns.
 pub type JoinOn = Vec<(PhysicalExprRef, PhysicalExprRef)>;
