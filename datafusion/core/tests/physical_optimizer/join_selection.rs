@@ -33,7 +33,7 @@ use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::col;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column, NegativeExpr};
 use datafusion_physical_expr::intervals::utils::check_support;
-use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_physical_expr::{HashPartitionMode, PhysicalExprRef};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_optimizer::join_selection::{
     hash_join_swap_subrule, JoinSelection,
@@ -316,7 +316,7 @@ async fn test_join_with_swap_semi() {
             None,
             &join_type,
             None,
-            PartitionMode::Partitioned,
+            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             false,
         )
         .unwrap();
@@ -641,12 +641,12 @@ async fn test_hash_join_swap_on_joins_with_projections(
         None,
         &join_type,
         Some(projection),
-        PartitionMode::Partitioned,
+        PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
         false,
     )?);
 
     let swapped = join
-        .swap_inputs(PartitionMode::Partitioned)
+        .swap_inputs(PartitionMode::Partitioned(HashPartitionMode::HashPartitioned))
         .expect("swap_hash_join must support joins with projections");
     let swapped_join = swapped.as_any().downcast_ref::<HashJoinExec>().expect(
             "ProjectionExec won't be added above if HashJoinExec contains embedded projection",
@@ -753,7 +753,7 @@ async fn test_join_selection_partitioned() {
         Arc::<StatisticsExec>::clone(&bigger),
         join_on,
         false,
-        PartitionMode::Partitioned,
+        PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
     );
 
     let join_on = vec![(
@@ -765,7 +765,7 @@ async fn test_join_selection_partitioned() {
         Arc::<StatisticsExec>::clone(&big),
         join_on,
         true,
-        PartitionMode::Partitioned,
+        PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
     );
 
     let join_on = vec![(
@@ -777,14 +777,14 @@ async fn test_join_selection_partitioned() {
         Arc::<StatisticsExec>::clone(&big),
         join_on,
         false,
-        PartitionMode::Partitioned,
+        PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
     );
 
     let join_on = vec![(
         Arc::new(Column::new_with_schema("big_col", &big.schema()).unwrap()) as _,
         Arc::new(Column::new_with_schema("empty_col", &empty.schema()).unwrap()) as _,
     )];
-    check_join_partition_mode(big, empty, join_on, false, PartitionMode::Partitioned);
+    check_join_partition_mode(big, empty, join_on, false, PartitionMode::Partitioned(HashPartitionMode::HashPartitioned));
 }
 
 fn check_join_partition_mode(
@@ -1118,40 +1118,40 @@ async fn test_join_with_swap_full() -> Result<()> {
             case: "Bounded - Unbounded 1".to_string(),
             initial_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             initial_join_type: JoinType::Full,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             expected_join_type: JoinType::Full,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         },
         TestCase {
             case: "Unbounded - Bounded 2".to_string(),
             initial_sources_unbounded: (SourceType::Unbounded, SourceType::Bounded),
             initial_join_type: JoinType::Full,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Unbounded, SourceType::Bounded),
             expected_join_type: JoinType::Full,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         },
         TestCase {
             case: "Bounded - Bounded 3".to_string(),
             initial_sources_unbounded: (SourceType::Bounded, SourceType::Bounded),
             initial_join_type: JoinType::Full,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Bounded),
             expected_join_type: JoinType::Full,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         },
         TestCase {
             case: "Unbounded - Unbounded 4".to_string(),
             initial_sources_unbounded: (SourceType::Unbounded, SourceType::Unbounded),
             initial_join_type: JoinType::Full,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Unbounded, SourceType::Unbounded),
             expected_join_type: JoinType::Full,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         },
     ];
@@ -1210,40 +1210,40 @@ async fn test_cases_without_collect_left_check() -> Result<()> {
             case: "Unbounded - Bounded / Partitioned".to_string(),
             initial_sources_unbounded: (SourceType::Unbounded, SourceType::Bounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             expected_join_type: join_type.swap(),
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: true,
         });
         cases.push(TestCase {
             case: "Bounded - Unbounded / Partitioned".to_string(),
             initial_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
         cases.push(TestCase {
             case: "Bounded - Bounded / Partitioned".to_string(),
             initial_sources_unbounded: (SourceType::Bounded, SourceType::Bounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Bounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
         cases.push(TestCase {
             case: "Unbounded - Unbounded / Partitioned".to_string(),
             initial_sources_unbounded: (SourceType::Unbounded, SourceType::Unbounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Unbounded, SourceType::Unbounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
     }
@@ -1265,40 +1265,40 @@ async fn test_not_support_collect_left() -> Result<()> {
             case: "Unbounded - Bounded".to_string(),
             initial_sources_unbounded: (SourceType::Unbounded, SourceType::Bounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             expected_join_type: join_type.swap(),
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: true,
         });
         cases.push(TestCase {
             case: "Bounded - Unbounded".to_string(),
             initial_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
         cases.push(TestCase {
             case: "Bounded - Bounded".to_string(),
             initial_sources_unbounded: (SourceType::Bounded, SourceType::Bounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Bounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
         cases.push(TestCase {
             case: "Unbounded - Unbounded".to_string(),
             initial_sources_unbounded: (SourceType::Unbounded, SourceType::Unbounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Unbounded, SourceType::Unbounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
     }
@@ -1365,40 +1365,40 @@ async fn test_not_supporting_swaps_possible_collect_left() -> Result<()> {
             case: "Unbounded - Bounded / Partitioned".to_string(),
             initial_sources_unbounded: (SourceType::Unbounded, SourceType::Bounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Unbounded, SourceType::Bounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
         cases.push(TestCase {
             case: "Bounded - Unbounded / Partitioned".to_string(),
             initial_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Unbounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
         cases.push(TestCase {
             case: "Bounded - Bounded / Partitioned".to_string(),
             initial_sources_unbounded: (SourceType::Bounded, SourceType::Bounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Bounded, SourceType::Bounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
         cases.push(TestCase {
             case: "Unbounded - Unbounded / Partitioned".to_string(),
             initial_sources_unbounded: (SourceType::Unbounded, SourceType::Unbounded),
             initial_join_type: join_type,
-            initial_mode: PartitionMode::Partitioned,
+            initial_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expected_sources_unbounded: (SourceType::Unbounded, SourceType::Unbounded),
             expected_join_type: join_type,
-            expected_mode: PartitionMode::Partitioned,
+            expected_mode: PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             expecting_swap: false,
         });
     }

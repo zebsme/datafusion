@@ -540,7 +540,7 @@ impl HashJoinExec {
             PartitionMode::Auto => Partitioning::UnknownPartitioning(
                 right.output_partitioning().partition_count(),
             ),
-            PartitionMode::Partitioned => {
+            PartitionMode::Partitioned(_) => {
                 symmetric_join_output_partitioning(left, right, &join_type)
             }
         };
@@ -710,22 +710,44 @@ impl ExecutionPlan for HashJoinExec {
                 Distribution::SinglePartition,
                 Distribution::UnspecifiedDistribution,
             ],
-            PartitionMode::Partitioned => {
-                let (left_expr, right_expr) = self
-                    .on
-                    .iter()
-                    .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
-                    .unzip();
-                vec![
-                    Distribution::HashPartitioned(
-                        left_expr,
-                        HashPartitionMode::HashPartitioned,
-                    ),
-                    Distribution::HashPartitioned(
-                        right_expr,
-                        HashPartitionMode::HashPartitioned,
-                    ),
-                ]
+            PartitionMode::Partitioned(mode) => {
+                match mode {
+                    HashPartitionMode::SelectionVector => {
+                        let (left_expr, right_expr) = self
+                            .on
+                            .iter()
+                            .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
+                            .unzip();
+                        vec![
+                            Distribution::HashPartitioned(
+                                left_expr,
+                                HashPartitionMode::SelectionVector,
+                            ),
+                            Distribution::HashPartitioned(
+                                right_expr,
+                                HashPartitionMode::SelectionVector,
+                            ),
+                            ]
+                    }
+                    HashPartitionMode::HashPartitioned => {
+                        let (left_expr, right_expr) = self
+                            .on
+                            .iter()
+                            .map(|(l, r)| (Arc::clone(l), Arc::clone(r)))
+                            .unzip();
+                        vec![
+                            Distribution::HashPartitioned(
+                                left_expr,
+                                HashPartitionMode::HashPartitioned,
+                            ),
+                            Distribution::HashPartitioned(
+                                right_expr,
+                                HashPartitionMode::HashPartitioned,
+                            ),
+                        ]
+                    }
+                }
+
             }
             PartitionMode::Auto => vec![
                 Distribution::UnspecifiedDistribution,
@@ -792,7 +814,7 @@ impl ExecutionPlan for HashJoinExec {
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
 
-        if self.mode == PartitionMode::Partitioned && left_partitions != right_partitions
+        if matches!(self.mode, PartitionMode::Partitioned(_)) && left_partitions != right_partitions
         {
             return internal_err!(
                 "Invalid HashJoinExec, partition count mismatch {left_partitions}!={right_partitions},\
@@ -817,7 +839,7 @@ impl ExecutionPlan for HashJoinExec {
                     self.right().output_partitioning().partition_count(),
                 )
             }),
-            PartitionMode::Partitioned => {
+            PartitionMode::Partitioned(_) => {
                 let reservation =
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
                         .register(context.memory_pool());
@@ -862,8 +884,10 @@ impl ExecutionPlan for HashJoinExec {
             Partitioning::HashSelectionVector(_, _)
         );
         //FIXME: used for test in first draft
-        with_selection_vector = true;
+        // with_selection_vector = true;
 
+        //Remove this
+        assert_eq!(with_selection_vector, true);
         Ok(Box::pin(HashJoinStream {
             schema: self.schema(),
             on_right,
@@ -880,7 +904,7 @@ impl ExecutionPlan for HashJoinExec {
             hashes_buffer: vec![],
             right_side_ordered: self.right.output_ordering().is_some(),
             //FIXME:
-            with_selection_vector: true,
+            with_selection_vector: with_selection_vector,
         }))
     }
 
@@ -1911,7 +1935,7 @@ mod tests {
             right,
             on,
             join_type,
-            PartitionMode::Partitioned,
+            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
             null_equals_null,
             context,
         )
@@ -1936,7 +1960,11 @@ mod tests {
 
         let left_repartitioned: Arc<dyn ExecutionPlan> = match partition_mode {
             PartitionMode::CollectLeft => Arc::new(CoalescePartitionsExec::new(left)),
-            PartitionMode::Partitioned => Arc::new(RepartitionExec::try_new(
+            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned) => Arc::new(RepartitionExec::try_new(
+                left,
+                Partitioning::Hash(left_expr, partition_count),
+            )?),
+            PartitionMode::Partitioned(HashPartitionMode::SelectionVector) => Arc::new(RepartitionExec::try_new(
                 left,
                 Partitioning::Hash(left_expr, partition_count),
             )?),
@@ -1957,9 +1985,13 @@ mod tests {
                     Partitioning::Hash(partition_expr, partition_count),
                 )?) as _
             }
-            PartitionMode::Partitioned => Arc::new(RepartitionExec::try_new(
+            PartitionMode::Partitioned(HashPartitionMode::HashPartitioned) => Arc::new(RepartitionExec::try_new(
                 right,
                 Partitioning::Hash(right_expr, partition_count),
+            )?),
+            PartitionMode::Partitioned(HashPartitionMode::SelectionVector) => Arc::new(RepartitionExec::try_new(
+                right,
+                Partitioning::HashSelectionVector(right_expr, partition_count),
             )?),
             PartitionMode::Auto => {
                 return internal_err!("Unexpected PartitionMode::Auto in join tests")
@@ -4273,7 +4305,7 @@ mod tests {
                 None,
                 &join_type,
                 None,
-                PartitionMode::Partitioned,
+                PartitionMode::Partitioned(HashPartitionMode::HashPartitioned),
                 false,
             )?;
 
