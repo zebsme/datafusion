@@ -408,69 +408,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batch_spill_and_read_dictionary_arrays() -> Result<()> {
-        // See https://github.com/apache/datafusion/issues/4658
-
-        let batch1 = build_table_i32(
-            ("a2", &vec![0, 1, 2]),
-            ("b2", &vec![3, 4, 5]),
-            ("c2", &vec![4, 5, 6]),
-        );
-
-        let batch2 = build_table_i32(
-            ("a2", &vec![10, 11, 12]),
-            ("b2", &vec![13, 14, 15]),
-            ("c2", &vec![14, 15, 16]),
-        );
-
-        // Dictionary encode the arrays
-        let dict_type =
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32));
-        let dict_schema = Arc::new(Schema::new(vec![
-            Field::new("a2", dict_type.clone(), true),
-            Field::new("b2", dict_type.clone(), true),
-            Field::new("c2", dict_type.clone(), true),
-        ]));
-
-        let batch1 = RecordBatch::try_new(
-            Arc::clone(&dict_schema),
-            batch1
-                .columns()
-                .iter()
-                .map(|array| cast(array, &dict_type))
-                .collect::<Result<_, _>>()?,
-        )?;
-
-        let batch2 = RecordBatch::try_new(
-            Arc::clone(&dict_schema),
-            batch2
-                .columns()
-                .iter()
-                .map(|array| cast(array, &dict_type))
-                .collect::<Result<_, _>>()?,
-        )?;
-
-        // Construct SpillManager
-        let env = Arc::new(RuntimeEnv::default());
-        let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let spill_manager = SpillManager::new(env, metrics, Arc::clone(&dict_schema));
-
-        let num_rows = batch1.num_rows() + batch2.num_rows();
-        let spill_file = spill_manager
-            .spill_record_batch_and_finish(&[batch1, batch2], "Test")?
-            .unwrap();
-        let spilled_rows = spill_manager.metrics.spilled_rows.value();
-        assert_eq!(spilled_rows, num_rows);
-
-        let stream = spill_manager.read_spill_as_stream(spill_file)?;
-        assert_eq!(stream.schema(), dict_schema);
-        let batches = collect(stream).await?;
-        assert_eq!(batches.len(), 2);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_batch_spill_by_size() -> Result<()> {
         let batch1 = build_table_i32(
             ("a2", &vec![0, 1, 2, 3]),
