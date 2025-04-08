@@ -20,32 +20,193 @@
 pub(crate) mod in_progress_spill_file;
 pub(crate) mod spill_manager;
 
+use arrow::array::ArrayData;
+use arrow::buffer::Buffer;
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::ipc::convert::fb_to_schema;
+use arrow::ipc::reader::{read_footer_length, FileDecoder};
+use arrow::ipc::writer::FileWriter;
+use arrow::ipc::{root_as_footer, writer::StreamWriter, Block};
+use arrow::record_batch::RecordBatch;
+use memmap2::Mmap;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-
-use arrow::array::ArrayData;
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
-use arrow::record_batch::RecordBatch;
+use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 use datafusion_common::{exec_datafusion_err, HashSet, Result};
 
+// >>> REMOVE THIS BLOCK <<<
+// -------------------------------------------------
 fn read_spill(sender: Sender<Result<RecordBatch>>, path: &Path) -> Result<()> {
-    let file = BufReader::new(File::open(path)?);
-    // SAFETY: DataFusion's spill writer strictly follows Arrow IPC specifications
-    // with validated schemas and buffers. Skip redundant validation during read
-    // to speedup read operation. This is safe for DataFusion as input guaranteed to be correct when written.
-    let reader = unsafe { StreamReader::try_new(file, None)?.with_skip_validation(true) };
-    for batch in reader {
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let bytes = bytes::Bytes::from_owner(mmap);
+    let buffer = Buffer::from(bytes);
+
+    // Now, use the FileDecoder API (wrapped by `IPCBufferDecoder` for
+    // convenience) to crate Arrays re-using the data in the underlying buffer
+    let decoder = IPCBufferDecoder::new(buffer);
+    for i in 0..decoder.num_batches() {
+        let batch = decoder.get_batch(i).unwrap().unwrap();
         sender
-            .blocking_send(batch.map_err(Into::into))
+            .blocking_send(Ok(batch))
             .map_err(|e| exec_datafusion_err!("{e}"))?;
     }
     Ok(())
 }
+
+pub struct IPCBufferDecoder {
+    /// Memory (or memory mapped) Buffer with the data
+    buffer: Buffer,
+    /// Decoder that reads Arrays that refers to the underlying buffers
+    decoder: FileDecoder,
+    /// Location of the batches within the buffer
+    batches: Vec<Block>,
+}
+
+impl IPCBufferDecoder {
+    pub fn new(buffer: Buffer) -> Self {
+        let trailer_start = buffer.len() - 10;
+        let footer_len =
+            read_footer_length(buffer[trailer_start..].try_into().unwrap()).unwrap();
+        let footer =
+            root_as_footer(&buffer[trailer_start - footer_len..trailer_start]).unwrap();
+
+        let schema = fb_to_schema(footer.schema().unwrap());
+
+        // SAFETY: DataFusion's spill writer strictly follows Arrow IPC specifications
+        // with validated schemas and buffers. Skip redundant validation during read
+        // to speedup read operation. This is safe for DataFusion as input guaranteed to be correct when written.
+        let mut decoder = unsafe {
+            FileDecoder::new(Arc::new(schema), footer.version())
+                .with_skip_validation(true)
+        };
+
+        // Read dictionaries
+        for block in footer.dictionaries().iter().flatten() {
+            let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+            let data = buffer.slice_with_length(block.offset() as _, block_len);
+            decoder.read_dictionary(block, &data.into()).unwrap();
+        }
+
+        // convert to Vec from the flatbuffers Vector to avoid having a direct dependency on flatbuffers
+        let batches = footer
+            .recordBatches()
+            .map(|b| b.iter().copied().collect())
+            .unwrap_or_default();
+
+        Self {
+            buffer,
+            decoder,
+            batches,
+        }
+    }
+
+    /// Return the number of [`RecordBatch`]es in this buffer
+    pub fn num_batches(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// Return the [`RecordBatch`] at message index `i`.
+    ///
+    /// This may return `None` if the IPC message was None
+    pub fn get_batch(&self, i: usize) -> Result<Option<RecordBatch>> {
+        let block = &self.batches[i];
+        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+        let data = self
+            .buffer
+            .slice_with_length(block.offset() as _, block_len);
+        self.decoder
+            .read_record_batch(block, &data.into())
+            .map_err(|e| e.into())
+    }
+}
+// ------------------------------------------------------------
+
+// // >>> UNCOMMENT BELOW <<<
+// // -------------------------------------------------------------
+// fn read_spill(sender: Sender<Result<RecordBatch>>, path: &Path) -> Result<()> {
+//     // Now, use the FileDecoder API (wrapped by `IPCBufferDecoder` for
+//     // convenience) to crate Arrays re-using the data in the underlying buffer
+//     let decoder = IPCBufferDecoder::new(&path);
+//     for i in 0..decoder.num_batches() {
+//         let batch = decoder.get_batch(i).unwrap().unwrap();
+//         sender
+//             .blocking_send(Ok(batch))
+//             .map_err(|e| exec_datafusion_err!("{e}"))?;
+//     }
+//     Ok(())
+// }
+//
+// pub struct IPCBufferDecoder {
+//     /// Memory (or memory mapped) Buffer with the data
+//     mmap: Mmap,
+//     /// Decoder that reads Arrays that refers to the underlying buffers
+//     decoder: FileDecoder,
+//     /// Location of the batches within the buffer
+//     batches: Vec<Block>,
+// }
+//
+// impl IPCBufferDecoder {
+//     pub fn new(path: &Path) -> Self {
+//         let ipc_file = File::open(path).unwrap();
+//         let mmap = unsafe { Mmap::map(&ipc_file).unwrap() };
+//         let trailer_start = mmap.len() - 10;
+//         let footer_len =
+//             read_footer_length(mmap[trailer_start..].try_into().unwrap()).unwrap();
+//         let footer =
+//             root_as_footer(&mmap[trailer_start - footer_len..trailer_start]).unwrap();
+//
+//         let schema = fb_to_schema(footer.schema().unwrap());
+//
+//         // SAFETY: DataFusion's spill writer strictly follows Arrow IPC specifications
+//         // with validated schemas and buffers. Skip redundant validation during read
+//         // to speedup read operation. This is safe for DataFusion as input guaranteed to be correct when written.
+//         let mut decoder = unsafe {
+//             FileDecoder::new(Arc::new(schema), footer.version())
+//                 .with_skip_validation(true)
+//         };
+//
+//         // Read dictionaries
+//         for block in footer.dictionaries().iter().flatten() {
+//             let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+//             let data = &mmap[block.offset() as _..block.offset() as usize + block_len];
+//             decoder.read_dictionary(block, &data.into()).unwrap();
+//         }
+//
+//         // convert to Vec from the flatbuffers Vector to avoid having a direct dependency on flatbuffers
+//         let batches = footer
+//             .recordBatches()
+//             .map(|b| b.iter().copied().collect())
+//             .unwrap_or_default();
+//
+//         Self {
+//             mmap,
+//             decoder,
+//             batches,
+//         }
+//     }
+//
+//     /// Return the number of [`RecordBatch`]es in this buffer
+//     pub fn num_batches(&self) -> usize {
+//         self.batches.len()
+//     }
+//
+//     /// Return the [`RecordBatch`] at message index `i`.
+//     ///
+//     /// This may return `None` if the IPC message was None
+//     pub fn get_batch(&self, i: usize) -> Result<Option<RecordBatch>> {
+//         let block = &self.batches[i];
+//         let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+//         let data = &self.mmap[block.offset() as _..block.offset() as usize + block_len];
+//         self.decoder
+//             .read_record_batch(block, &data.into())
+//             .map_err(|e| e.into())
+//     }
+// }
+// // -------------------------------------------------------------
 
 /// Spill the `RecordBatch` to disk as smaller batches
 /// split by `batch_size_rows`
@@ -61,7 +222,7 @@ pub fn spill_record_batch_by_size(
 ) -> Result<()> {
     let mut offset = 0;
     let total_rows = batch.num_rows();
-    let mut writer = IPCStreamWriter::new(&path, schema.as_ref())?;
+    let mut writer = IPCFileWriter::new(&path, schema.as_ref())?;
 
     while offset < total_rows {
         let length = std::cmp::min(total_rows - offset, batch_size_rows);
@@ -146,9 +307,9 @@ fn count_array_data_memory_size(
 ///
 /// Stream format is used for spill because it supports dictionary replacement, and the random
 /// access of IPC File format is not needed (IPC File format doesn't support dictionary replacement).
-struct IPCStreamWriter {
+struct IPCFileWriter {
     /// Inner writer
-    pub writer: StreamWriter<File>,
+    pub writer: FileWriter<File>,
     /// Batches written
     pub num_batches: usize,
     /// Rows written
@@ -157,7 +318,7 @@ struct IPCStreamWriter {
     pub num_bytes: usize,
 }
 
-impl IPCStreamWriter {
+impl IPCFileWriter {
     /// Create new writer
     pub fn new(path: &Path, schema: &Schema) -> Result<Self> {
         let file = File::create(path).map_err(|e| {
@@ -167,7 +328,7 @@ impl IPCStreamWriter {
             num_batches: 0,
             num_rows: 0,
             num_bytes: 0,
-            writer: StreamWriter::try_new(file, schema)?,
+            writer: FileWriter::try_new(file, schema)?,
         })
     }
 

@@ -25,7 +25,6 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Formatter;
 use std::fs::File;
-use std::io::BufReader;
 use std::mem::size_of;
 use std::ops::Range;
 use std::pin::Pin;
@@ -56,6 +55,7 @@ use crate::{
 };
 
 use arrow::array::{types::UInt64Type, *};
+use arrow::buffer::Buffer;
 use arrow::compute::{
     self, concat_batches, filter_record_batch, is_not_null, take, SortOptions,
 };
@@ -75,7 +75,9 @@ use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
 
+use crate::spill::IPCBufferDecoder;
 use futures::{Stream, StreamExt};
+use memmap2::Mmap;
 
 /// Join execution plan that executes equi-join predicates on multiple partitions using Sort-Merge
 /// join algorithm and applies an optional filter post join. Can be used to join arbitrarily large
@@ -2305,11 +2307,21 @@ fn fetch_right_columns_from_batch_by_idxs(
             let mut buffered_cols: Vec<ArrayRef> =
                 Vec::with_capacity(buffered_indices.len());
 
-            let file = BufReader::new(File::open(spill_file.path())?);
-            let reader = StreamReader::try_new(file, None)?;
+            // >>> REMOVE THIS BLOCK <<<
+            // -------------------------------------------
+            let file = File::open(spill_file.path())?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let bytes = bytes::Bytes::from_owner(mmap);
+            let buffer = Buffer::from(bytes);
+            let decoder = IPCBufferDecoder::new(buffer);
+            // -------------------------------------------
 
-            for batch in reader {
-                batch?.columns().iter().for_each(|column| {
+            // >>> UNCOMMENT BELOW <<<
+            // let decoder = IPCBufferDecoder::new(spill_file.path());
+
+            for i in 0..decoder.num_batches(){
+                let batch = decoder.get_batch(i).unwrap().unwrap();
+                batch.columns().iter().for_each(|column| {
                     buffered_cols.extend(take(column, &buffered_indices, None))
                 });
             }
